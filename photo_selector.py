@@ -4,7 +4,11 @@ Wedding Photo Selector
 ======================
 A cross-platform photo viewer for selecting wedding photos.
 Browse photos from a USB drive, like the ones you want, and they'll be
-copied + renamed sequentially into a 'selected' folder on the same drive.
+copied + renamed sequentially into a profile-specific folder on the same drive.
+
+Supports multiple profiles — each person gets their own folder, naming,
+and independent progress tracking. Shows cross-selection indicators when
+another profile has also picked the same photo.
 
 Controls:
     → / d          Next photo
@@ -55,10 +59,121 @@ RAW_EXTENSIONS = {
     ".mrw", ".nrw", ".ptx", ".r3d", ".raw", ".rwl", ".rwz",
 }
 
-PROGRESS_FILE = ".photo_selector_progress.json"
-SELECTED_DIR = "Aniket_Selected"
-NAMING_PREFIX = "aniket_selected_"
+# Default profiles (shown as quick-select buttons)
+DEFAULT_PROFILES = ["Aniket", "Aditi"]
+
 SUMMARY_FILE = "selection_summary.txt"
+
+
+def profile_dir_name(name: str) -> str:
+    """Convert profile name to folder name: 'Aniket' -> 'Aniket_Selected'."""
+    return f"{name}_Selected"
+
+
+def profile_prefix(name: str) -> str:
+    """Convert profile name to file prefix: 'Aniket' -> 'aniket_selected_'."""
+    return f"{name.lower()}_selected_"
+
+
+def profile_progress_file(name: str) -> str:
+    """Convert profile name to progress filename: 'Aniket' -> '.photo_selector_aniket.json'."""
+    return f".photo_selector_{name.lower()}.json"
+
+
+class ProfileDialog:
+    """Modal dialog for selecting or creating a profile."""
+
+    def __init__(self, parent: tk.Tk):
+        self.result: str | None = None
+
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("Who's selecting photos?")
+        self.dialog.configure(bg="#1a1a1a")
+        self.dialog.geometry("400x320")
+        self.dialog.resizable(False, False)
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+
+        # Center on screen
+        self.dialog.update_idletasks()
+        x = (self.dialog.winfo_screenwidth() - 400) // 2
+        y = (self.dialog.winfo_screenheight() - 320) // 2
+        self.dialog.geometry(f"+{x}+{y}")
+
+        # Title
+        tk.Label(
+            self.dialog, text="Welcome!", fg="white", bg="#1a1a1a",
+            font=("Helvetica", 18, "bold"),
+        ).pack(pady=(20, 5))
+
+        tk.Label(
+            self.dialog, text="Who's selecting photos today?",
+            fg="#aaaaaa", bg="#1a1a1a", font=("Helvetica", 12),
+        ).pack(pady=(0, 15))
+
+        # Quick-select buttons for default profiles
+        btn_frame = tk.Frame(self.dialog, bg="#1a1a1a")
+        btn_frame.pack(pady=5)
+
+        for name in DEFAULT_PROFILES:
+            btn = tk.Button(
+                btn_frame, text=name, width=12,
+                fg="white", bg="#2980b9", font=("Helvetica", 13, "bold"),
+                relief="flat", padx=16, pady=8, cursor="hand2",
+                command=lambda n=name: self._select(n),
+            )
+            btn.pack(side=tk.LEFT, padx=10)
+
+        # Separator
+        tk.Label(
+            self.dialog, text="— or enter a new name —",
+            fg="#666666", bg="#1a1a1a", font=("Helvetica", 10),
+        ).pack(pady=10)
+
+        # Custom name entry
+        entry_frame = tk.Frame(self.dialog, bg="#1a1a1a")
+        entry_frame.pack(pady=5)
+
+        self.entry = tk.Entry(
+            entry_frame, font=("Helvetica", 13), width=20,
+            bg="#333333", fg="white", insertbackground="white",
+            relief="flat",
+        )
+        self.entry.pack(side=tk.LEFT, padx=(0, 8), ipady=4)
+        self.entry.bind("<Return>", lambda e: self._use_custom())
+
+        tk.Button(
+            entry_frame, text="Go", fg="white", bg="#27ae60",
+            font=("Helvetica", 12, "bold"), relief="flat", padx=12, pady=4,
+            cursor="hand2", command=self._use_custom,
+        ).pack(side=tk.LEFT)
+
+        # Handle window close
+        self.dialog.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.entry.focus_set()
+
+    def _select(self, name: str):
+        self.result = name
+        self.dialog.destroy()
+
+    def _use_custom(self):
+        name = self.entry.get().strip()
+        if not name:
+            return
+        # Sanitize: capitalize first letter, remove unsafe chars
+        name = "".join(c for c in name if c.isalnum() or c in " _-")
+        name = name.strip().title()
+        if name:
+            self.result = name
+            self.dialog.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.dialog.destroy()
+
+    def wait(self) -> str | None:
+        self.dialog.wait_window()
+        return self.result
 
 
 class PhotoSelector:
@@ -68,10 +183,15 @@ class PhotoSelector:
         self.root.configure(bg="black")
         self.root.geometry("1200x800")
 
+        # Profile (set after dialog)
+        self.profile_name: str = ""
+        self.naming_prefix: str = ""
+        self.selected_dir_name: str = ""
+        self.progress_filename: str = ""
+
         # State
         self.photos: list[Path] = []
         self.current_index: int = 0
-        # Maps relative source path -> selected filename (e.g. "aniket_selected_001.jpg")
         self.liked: dict[str, str] = {}
         self.like_counter: int = 0
         self.source_dir: Path | None = None
@@ -79,29 +199,37 @@ class PhotoSelector:
         self.selected_dir: Path | None = None
         self.is_fullscreen: bool = False
         self.slideshow_active: bool = False
-        self.slideshow_delay: int = 3000  # ms
+        self.slideshow_delay: int = 3000
         self.slideshow_job = None
-        self.current_image = None  # keep reference to prevent GC
+        self.current_image = None
         self._resize_job = None
         self._progress_dirty = False
         self._help_visible = False
-        self._help_widgets = []
 
-        # Undo stack: list of (action, rel_key, selected_name, photo_index) tuples
+        # Other profiles' selections (for cross-selection display)
+        self._other_profiles: dict[str, set[str]] = {}
+
+        # Undo stack
         self._undo_stack: list[tuple[str, str, str, int]] = []
 
         # UI setup
         self._build_ui()
         self._bind_keys()
 
-        # Start by asking for the photo directory
-        self.root.after(100, self._choose_directory)
+        # Start with profile selection
+        self.root.after(100, self._choose_profile)
 
     def _build_ui(self):
         # Top bar
         self.top_frame = tk.Frame(self.root, bg="#1a1a1a", height=40)
         self.top_frame.pack(fill=tk.X, side=tk.TOP)
         self.top_frame.pack_propagate(False)
+
+        self.profile_label = tk.Label(
+            self.top_frame, text="", fg="#3498db", bg="#1a1a1a",
+            font=("Helvetica", 12, "bold"), padx=10,
+        )
+        self.profile_label.pack(side=tk.LEFT)
 
         self.info_label = tk.Label(
             self.top_frame, text="", fg="white", bg="#1a1a1a",
@@ -170,13 +298,12 @@ class PhotoSelector:
         )
         self.status_label.pack(side=tk.RIGHT)
 
-        # Flash overlay (shown briefly on like/dislike)
+        # Flash overlay
         self.flash_label = tk.Label(
             self.canvas, text="", fg="#e74c3c", bg="black",
             font=("Helvetica", 28, "bold"),
         )
 
-        # Bind resize
         self.canvas.bind("<Configure>", self._on_resize)
 
     def _bind_keys(self):
@@ -192,7 +319,7 @@ class PhotoSelector:
         self.root.bind("<Delete>", lambda e: self._dislike_photo())
         self.root.bind("<BackSpace>", lambda e: self._dislike_photo())
         self.root.bind("<Control-z>", lambda e: self._undo())
-        self.root.bind("<Command-z>", lambda e: self._undo())  # macOS Cmd+Z
+        self.root.bind("<Command-z>", lambda e: self._undo())
         self.root.bind("e", lambda e: self._export_summary())
         self.root.bind("E", lambda e: self._export_summary())
         self.root.bind("p", lambda e: self._toggle_slideshow())
@@ -211,8 +338,60 @@ class PhotoSelector:
         self.root.bind("Q", lambda e: self._quit())
         self.root.bind("<Escape>", lambda e: self._quit())
 
+    # --- Profile ---
+
+    def _choose_profile(self):
+        dialog = ProfileDialog(self.root)
+        name = dialog.wait()
+        if not name:
+            self.root.destroy()
+            return
+
+        self.profile_name = name
+        self.naming_prefix = profile_prefix(name)
+        self.selected_dir_name = profile_dir_name(name)
+        self.progress_filename = profile_progress_file(name)
+
+        self.root.title(f"Wedding Photo Selector — {name}")
+        self.profile_label.config(text=f"[{name}]")
+
+        self.root.after(50, self._choose_directory)
+
+    def _load_other_profiles(self):
+        """Load other profiles' liked sets for cross-selection display."""
+        self._other_profiles = {}
+        if not self.drive_root:
+            return
+        try:
+            for f in self.drive_root.iterdir():
+                if (f.name.startswith(".photo_selector_")
+                        and f.name.endswith(".json")
+                        and f.name != self.progress_filename):
+                    # Extract profile name from filename
+                    # .photo_selector_aditi.json -> Aditi
+                    stem = f.stem  # .photo_selector_aditi
+                    other_name = stem.replace(".photo_selector_", "").title()
+                    try:
+                        data = json.loads(f.read_text(encoding="utf-8"))
+                        liked_data = data.get("liked", {})
+                        if isinstance(liked_data, list):
+                            keys = set(liked_data)
+                        else:
+                            keys = set(liked_data.keys())
+                        if keys:
+                            self._other_profiles[other_name] = keys
+                    except (json.JSONDecodeError, OSError):
+                        pass
+        except OSError:
+            pass
+
+    def _get_cross_selections(self, rel_key: str) -> list[str]:
+        """Return list of other profile names that have selected this photo."""
+        return [name for name, keys in self._other_profiles.items() if rel_key in keys]
+
+    # --- Helpers ---
+
     def _relative_key(self, photo_path: Path) -> str:
-        """Return a path relative to source_dir for stable cross-session tracking."""
         try:
             return str(photo_path.relative_to(self.source_dir))
         except ValueError:
@@ -220,49 +399,35 @@ class PhotoSelector:
 
     @staticmethod
     def _find_drive_root(path: Path) -> Path:
-        """Find the root/mount point of the drive containing the given path.
-
-        - macOS: /Volumes/USB_NAME/
-        - Windows: E:\\
-        - Linux: /media/user/USB_NAME/ or /mnt/usb/
-        - Fallback: the path itself (if not on a removable drive)
-        """
         resolved = path.resolve()
 
-        # macOS: /Volumes/<name>/...
         if str(resolved).startswith("/Volumes/"):
-            parts = resolved.parts  # ('/', 'Volumes', 'USB_NAME', ...)
+            parts = resolved.parts
             if len(parts) >= 3:
                 return Path(parts[0]) / parts[1] / parts[2]
 
-        # Linux: /media/<user>/<name>/...
         if str(resolved).startswith("/media/"):
             parts = resolved.parts
             if len(parts) >= 4:
                 return Path(parts[0]) / parts[1] / parts[2] / parts[3]
 
-        # Linux: /mnt/<name>/...
         if str(resolved).startswith("/mnt/"):
             parts = resolved.parts
             if len(parts) >= 3:
                 return Path(parts[0]) / parts[1] / parts[2]
 
-        # Windows: drive letter root (e.g. E:\)
         if platform.system() == "Windows":
             return Path(resolved.anchor)
 
-        # Fallback: use the selected directory itself
         return path
 
     def _is_drive_accessible(self) -> bool:
-        """Check if the USB drive is still accessible."""
         try:
             return self.drive_root.exists() and os.access(str(self.drive_root), os.R_OK)
         except OSError:
             return False
 
     def _check_drive(self) -> bool:
-        """Check drive accessibility and show error if disconnected. Returns True if OK."""
         if self._is_drive_accessible():
             return True
         messagebox.showerror(
@@ -272,6 +437,8 @@ class PhotoSelector:
             "Your progress up to the last save has been preserved.",
         )
         return False
+
+    # --- Directory & Scanning ---
 
     def _choose_directory(self):
         directory = filedialog.askdirectory(
@@ -284,15 +451,30 @@ class PhotoSelector:
 
         self.source_dir = Path(directory)
         self.drive_root = self._find_drive_root(self.source_dir)
-        self.selected_dir = self.drive_root / SELECTED_DIR
+        self.selected_dir = self.drive_root / self.selected_dir_name
         self._scan_photos()
         self._load_progress()
+        self._load_other_profiles()
         self._show_current()
 
     def _scan_photos(self):
         all_extensions = IMAGE_EXTENSIONS.copy()
         if RAW_SUPPORT:
             all_extensions |= RAW_EXTENSIONS
+
+        # Collect all profile folder names to exclude from scanning
+        excluded_dirs = set()
+        for name in DEFAULT_PROFILES:
+            excluded_dirs.add(profile_dir_name(name))
+        excluded_dirs.add(self.selected_dir_name)
+        # Also exclude any existing *_Selected folders on the drive
+        if self.drive_root:
+            try:
+                for d in self.drive_root.iterdir():
+                    if d.is_dir() and d.name.endswith("_Selected"):
+                        excluded_dirs.add(d.name)
+            except OSError:
+                pass
 
         files = []
 
@@ -301,7 +483,7 @@ class PhotoSelector:
                 for f in sorted(directory.iterdir()):
                     if f.is_file() and f.suffix.lower() in all_extensions:
                         files.append(f)
-                    elif f.is_dir() and f.name != SELECTED_DIR:
+                    elif f.is_dir() and f.name not in excluded_dirs:
                         _collect(f)
             except PermissionError:
                 pass
@@ -317,18 +499,18 @@ class PhotoSelector:
             )
             self.root.destroy()
 
+    # --- Progress ---
+
     def _load_progress(self):
-        progress_path = self.drive_root / PROGRESS_FILE
+        progress_path = self.drive_root / self.progress_filename
         if progress_path.exists():
             try:
                 data = json.loads(progress_path.read_text(encoding="utf-8"))
                 self.current_index = min(data.get("current_index", 0), len(self.photos) - 1)
                 self.like_counter = data.get("like_counter", 0)
 
-                # Support both old format (list) and new format (dict)
                 liked_data = data.get("liked", {})
                 if isinstance(liked_data, list):
-                    # Migrate old format: no filename mapping available
                     self.liked = {path: "" for path in liked_data}
                 else:
                     self.liked = liked_data
@@ -336,9 +518,9 @@ class PhotoSelector:
                 if self.current_index > 0:
                     resume = messagebox.askyesno(
                         "Resume?",
-                        f"Found previous session.\n"
+                        f"Welcome back, {self.profile_name}!\n\n"
                         f"Resume from photo {self.current_index + 1}/{len(self.photos)}?\n"
-                        f"({len(self.liked)} photos selected)\n\n"
+                        f"({len(self.liked)} photos already selected)\n\n"
                         f"Yes = Resume | No = Start from beginning",
                     )
                     if not resume:
@@ -351,7 +533,7 @@ class PhotoSelector:
             return
         if not self._is_drive_accessible():
             return
-        progress_path = self.drive_root / PROGRESS_FILE
+        progress_path = self.drive_root / self.progress_filename
         data = {
             "current_index": self.current_index,
             "liked": self.liked,
@@ -364,8 +546,9 @@ class PhotoSelector:
             pass
 
     def _mark_dirty(self):
-        """Mark progress as needing a save, and schedule a debounced write."""
         self._progress_dirty = True
+
+    # --- Image Loading ---
 
     def _load_image(self, path: Path) -> Image.Image | None:
         try:
@@ -378,7 +561,6 @@ class PhotoSelector:
             else:
                 img = Image.open(path)
                 img.load()
-                # Handle EXIF rotation
                 try:
                     from PIL import ImageOps
                     img = ImageOps.exif_transpose(img)
@@ -386,13 +568,14 @@ class PhotoSelector:
                     pass
                 return img
         except OSError:
-            # File may be on a disconnected drive
             if not self._check_drive():
                 return None
             return None
         except Exception as e:
             print(f"Error loading {path}: {e}")
             return None
+
+    # --- Display ---
 
     def _show_current(self):
         if not self.photos:
@@ -406,7 +589,6 @@ class PhotoSelector:
             self._update_counter()
             return
 
-        # Fit image to canvas
         canvas_w = self.canvas.winfo_width() or 1200
         canvas_h = self.canvas.winfo_height() or 700
 
@@ -423,17 +605,30 @@ class PhotoSelector:
         y = canvas_h // 2
         self.canvas.create_image(x, y, anchor=tk.CENTER, image=self.current_image)
 
-        # Show info
+        # Build info text
         rel_key = self._relative_key(photo_path)
         is_liked = rel_key in self.liked
-        liked_marker = " [LIKED]" if is_liked else ""
-        raw_marker = " [RAW]" if photo_path.suffix.lower() in RAW_EXTENSIONS else ""
+        markers = []
+        if photo_path.suffix.lower() in RAW_EXTENSIONS:
+            markers.append("[RAW]")
+        if is_liked:
+            markers.append("[LIKED]")
+
+        # Cross-selection indicator
+        others = self._get_cross_selections(rel_key)
+        if others:
+            names = ", ".join(others)
+            markers.append(f"[Also picked by {names}]")
+
+        marker_str = " ".join(markers)
+        if marker_str:
+            marker_str = "  " + marker_str
+
         self.info_label.config(
-            text=f"{photo_path.name}{raw_marker}{liked_marker}  |  "
+            text=f"{photo_path.name}{marker_str}  |  "
                  f"{img_w}x{img_h}  |  {self._format_size(photo_path)}",
         )
 
-        # Update like/dislike button states
         if is_liked:
             self.like_btn.config(text="♥ Liked", bg="#27ae60")
             self.dislike_btn.config(state=tk.NORMAL, bg="#c0392b")
@@ -442,7 +637,6 @@ class PhotoSelector:
             self.dislike_btn.config(state=tk.DISABLED, bg="#555555")
 
         self._update_counter()
-        # Mark dirty for navigation tracking; actual write is deferred to quit
         self._progress_dirty = True
 
     def _update_counter(self):
@@ -454,7 +648,6 @@ class PhotoSelector:
         state = "Playing" if self.slideshow_active else "Paused"
         self.slideshow_label.config(text=f"Slideshow: {state} ({speed_sec:.1f}s)")
 
-        # Update undo button state
         if self._undo_stack:
             self.undo_btn.config(state=tk.NORMAL, bg="#333333")
         else:
@@ -469,17 +662,21 @@ class PhotoSelector:
             size /= 1024
         return f"{size:.1f} TB"
 
+    # --- Navigation ---
+
     def _next_photo(self):
         if self.current_index < len(self.photos) - 1:
             self.current_index += 1
             self._show_current()
         elif self.slideshow_active:
-            self._toggle_slideshow()  # Stop at end
+            self._toggle_slideshow()
 
     def _prev_photo(self):
         if self.current_index > 0:
             self.current_index -= 1
             self._show_current()
+
+    # --- Like / Dislike / Undo ---
 
     def _like_photo(self):
         if not self.photos:
@@ -494,7 +691,6 @@ class PhotoSelector:
             self._show_flash("Already selected!")
             return
 
-        # Create selected directory if needed
         if not self.selected_dir.exists():
             try:
                 self.selected_dir.mkdir(parents=True, exist_ok=True)
@@ -502,10 +698,9 @@ class PhotoSelector:
                 messagebox.showerror("Error", f"Cannot create selected folder:\n{e}")
                 return
 
-        # Copy with sequential name
         self.like_counter += 1
         ext = photo_path.suffix.lower()
-        new_name = f"{NAMING_PREFIX}{self.like_counter:03d}{ext}"
+        new_name = f"{self.naming_prefix}{self.like_counter:03d}{ext}"
         dest = self.selected_dir / new_name
 
         try:
@@ -557,7 +752,6 @@ class PhotoSelector:
         self._show_current()
 
     def _undo(self):
-        """Undo the last like or dislike action."""
         if not self._undo_stack:
             self._show_flash("Nothing to undo")
             return
@@ -567,7 +761,6 @@ class PhotoSelector:
         action, rel_key, selected_name, photo_index = self._undo_stack.pop()
 
         if action == "like":
-            # Undo a like: remove the copied file and unmark
             if selected_name and self.selected_dir:
                 selected_path = self.selected_dir / selected_name
                 try:
@@ -579,7 +772,6 @@ class PhotoSelector:
             self._show_flash(f"↩ Undo: removed {selected_name}")
 
         elif action == "dislike":
-            # Undo a dislike: re-copy the file and re-mark
             source_path = self.source_dir / rel_key
             if source_path.exists() and selected_name:
                 if not self.selected_dir.exists():
@@ -596,14 +788,14 @@ class PhotoSelector:
                 self._show_flash("↩ Undo failed: source missing")
                 return
 
-        # Navigate to the photo that was affected
         self.current_index = min(photo_index, len(self.photos) - 1)
         self._mark_dirty()
         self._save_progress()
         self._show_current()
 
+    # --- Help Overlay ---
+
     def _toggle_help(self):
-        """Show or hide the keyboard shortcuts overlay."""
         if self._help_visible:
             self._hide_help()
         else:
@@ -634,15 +826,13 @@ class PhotoSelector:
             ]),
         ]
 
-        # Semi-transparent background overlay
         canvas_w = self.canvas.winfo_width() or 1200
         canvas_h = self.canvas.winfo_height() or 700
 
-        overlay = self.canvas.create_rectangle(
+        self.canvas.create_rectangle(
             0, 0, canvas_w, canvas_h, fill="black", stipple="gray50", tags="help",
         )
 
-        # Title
         y_pos = canvas_h // 2 - 180
         self.canvas.create_text(
             canvas_w // 2, y_pos, text="Keyboard Shortcuts",
@@ -677,8 +867,9 @@ class PhotoSelector:
         self._help_visible = False
         self.canvas.delete("help")
 
+    # --- Export ---
+
     def _export_summary(self):
-        """Export a text summary of selected photos for the photographer."""
         if not self.liked:
             self._show_flash("No photos selected yet")
             return
@@ -687,9 +878,10 @@ class PhotoSelector:
 
         lines = []
         lines.append("=" * 60)
-        lines.append("WEDDING PHOTO SELECTION SUMMARY")
+        lines.append(f"WEDDING PHOTO SELECTION — {self.profile_name.upper()}")
         lines.append("=" * 60)
         lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        lines.append(f"Profile:   {self.profile_name}")
         lines.append(f"Source:    {self.source_dir}")
         lines.append(f"Output:    {self.selected_dir}")
         lines.append(f"Total selected: {len(self.liked)} photos")
@@ -698,7 +890,6 @@ class PhotoSelector:
         lines.append(f"{'Selected Name':<35} {'Original File'}")
         lines.append("-" * 60)
 
-        # Sort by selected name for clean output
         sorted_items = sorted(self.liked.items(), key=lambda x: x[1])
         for original_rel, selected_name in sorted_items:
             if selected_name:
@@ -709,8 +900,9 @@ class PhotoSelector:
         lines.append("-" * 60)
         lines.append("")
         lines.append("INSTRUCTIONS FOR PHOTOGRAPHER:")
-        lines.append(f"  All selected photos are in the '{SELECTED_DIR}' folder.")
-        lines.append(f"  Files are named {NAMING_PREFIX}001, 002, etc.")
+        lines.append(f"  Selected by: {self.profile_name}")
+        lines.append(f"  All selected photos are in the '{self.selected_dir_name}' folder.")
+        lines.append(f"  Files are named {self.naming_prefix}001, 002, etc.")
         lines.append("  Original filenames are listed above for reference.")
         lines.append("")
 
@@ -725,18 +917,19 @@ class PhotoSelector:
         except OSError as e:
             messagebox.showerror("Export Error", f"Failed to export summary:\n{e}")
 
+    # --- Flash / Slideshow / Fullscreen ---
+
     def _show_flash(self, text: str):
-        # Set color based on action
         if "Removed" in text or "✕" in text:
-            color = "#e67e22"  # orange for removal
+            color = "#e67e22"
         elif "♥" in text or "Saved" in text:
-            color = "#2ecc71"  # green for like
+            color = "#2ecc71"
         elif "↩" in text:
-            color = "#3498db"  # blue for undo
+            color = "#3498db"
         elif "📋" in text or "Export" in text:
-            color = "#9b59b6"  # purple for export
+            color = "#9b59b6"
         else:
-            color = "#e74c3c"  # red for info
+            color = "#e74c3c"
 
         self.flash_label.config(text=text, fg=color)
         self.flash_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
@@ -770,7 +963,6 @@ class PhotoSelector:
     def _toggle_fullscreen(self):
         self.is_fullscreen = not self.is_fullscreen
         self.root.attributes("-fullscreen", self.is_fullscreen)
-        # On macOS, also handle the topmost attribute
         if platform.system() == "Darwin":
             self.root.attributes("-topmost", self.is_fullscreen)
 
