@@ -406,6 +406,74 @@ def test_subfolder_selection_shared_output():
         shutil.rmtree(tmp)
 
 
+def test_counter_continuity_across_folders():
+    """Test that naming continues from where it left off across folder switches."""
+    print("\n--- Test: Counter Continuity Across Folders ---")
+    tmp = setup_test_dir()
+    try:
+        drive_root = tmp  # simulate drive root
+        selected_dir = drive_root / ps.SELECTED_DIR
+        selected_dir.mkdir()
+        progress_path = drive_root / ps.PROGRESS_FILE
+
+        # Session 1: browse root folder, like 3 photos
+        liked = {}
+        counter = 0
+        for i in range(3):
+            photo = tmp / f"IMG_{i:04d}.jpg"
+            rel_key = str(photo.relative_to(tmp))
+            counter += 1
+            ext = photo.suffix.lower()
+            new_name = f"{ps.NAMING_PREFIX}{counter:03d}{ext}"
+            shutil.copy2(str(photo), str(selected_dir / new_name))
+            liked[rel_key] = new_name
+
+        # Save progress (as the app would on quit)
+        data = {"current_index": 2, "liked": liked, "like_counter": counter}
+        progress_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+        result("Session 1: 3 files in Aniket_Selected",
+               len(list(selected_dir.iterdir())) == 3)
+        result("Session 1: counter at 3", counter == 3)
+        result("Session 1: last file is _003",
+               liked[f"IMG_0002.jpg"] == "aniket_selected_003.jpg")
+
+        # Session 2: browse DCIM subfolder, load progress, like 2 more
+        loaded = json.loads(progress_path.read_text(encoding="utf-8"))
+        counter = loaded["like_counter"]  # restored to 3
+        liked = loaded["liked"]
+
+        result("Session 2: counter restored to 3", counter == 3)
+
+        dcim = tmp / "DCIM"
+        for i in range(2):
+            photo = dcim / f"DSC_{i:04d}.jpg"
+            rel_key = str(photo.relative_to(tmp))
+            counter += 1
+            ext = photo.suffix.lower()
+            new_name = f"{ps.NAMING_PREFIX}{counter:03d}{ext}"
+            shutil.copy2(str(photo), str(selected_dir / new_name))
+            liked[rel_key] = new_name
+
+        result("Session 2: first new file is _004",
+               liked["DCIM/DSC_0000.jpg"] == "aniket_selected_004.jpg",
+               f"Got {liked.get('DCIM/DSC_0000.jpg')}")
+        result("Session 2: second new file is _005",
+               liked["DCIM/DSC_0001.jpg"] == "aniket_selected_005.jpg",
+               f"Got {liked.get('DCIM/DSC_0001.jpg')}")
+        result("Session 2: total 5 files in Aniket_Selected",
+               len(list(selected_dir.iterdir())) == 5)
+        result("Session 2: counter at 5", counter == 5)
+
+        # Verify all files exist with correct names
+        for i in range(1, 6):
+            expected = selected_dir / f"{ps.NAMING_PREFIX}{i:03d}.jpg"
+            result(f"File aniket_selected_{i:03d}.jpg exists", expected.exists(),
+                   f"{expected} missing")
+    finally:
+        shutil.rmtree(tmp)
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Wedding Photo Selector — Core Logic Tests")
@@ -422,6 +490,7 @@ if __name__ == "__main__":
     test_file_extension_preservation()
     test_drive_root_detection()
     test_subfolder_selection_shared_output()
+    test_counter_continuity_across_folders()
 
     print("\n" + "=" * 60)
     print(f"Results: {PASS} passed, {FAIL} failed out of {PASS + FAIL} tests")
