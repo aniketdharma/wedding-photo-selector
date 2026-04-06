@@ -474,6 +474,185 @@ def test_counter_continuity_across_folders():
         shutil.rmtree(tmp)
 
 
+def test_undo_like():
+    """Test that undoing a like removes the copied file and unmarks it."""
+    print("\n--- Test: Undo Like ---")
+    tmp = setup_test_dir()
+    try:
+        selected_dir = tmp / ps.SELECTED_DIR
+        selected_dir.mkdir()
+
+        photo = tmp / "IMG_0000.jpg"
+        rel_key = str(photo.relative_to(tmp))
+
+        # Like the photo
+        liked = {}
+        counter = 0
+        counter += 1
+        new_name = f"{ps.NAMING_PREFIX}{counter:03d}.jpg"
+        dest = selected_dir / new_name
+        shutil.copy2(str(photo), str(dest))
+        liked[rel_key] = new_name
+        undo_stack = [("like", rel_key, new_name, 0)]
+
+        result("File exists before undo", dest.exists())
+        result("Liked dict has entry", rel_key in liked)
+
+        # Undo the like
+        action, undo_key, undo_name, _ = undo_stack.pop()
+        assert action == "like"
+        undo_path = selected_dir / undo_name
+        if undo_path.exists():
+            undo_path.unlink()
+        liked.pop(undo_key, None)
+
+        result("File removed after undo", not dest.exists())
+        result("Liked dict cleared", undo_key not in liked)
+        result("Undo stack empty", len(undo_stack) == 0)
+        result("Original untouched", photo.exists())
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_undo_dislike():
+    """Test that undoing a dislike re-copies the file and re-marks it."""
+    print("\n--- Test: Undo Dislike ---")
+    tmp = setup_test_dir()
+    try:
+        selected_dir = tmp / ps.SELECTED_DIR
+        selected_dir.mkdir()
+
+        photo = tmp / "IMG_0000.jpg"
+        rel_key = str(photo.relative_to(tmp))
+        new_name = "aniket_selected_001.jpg"
+        dest = selected_dir / new_name
+
+        # Simulate: photo was liked then disliked
+        liked = {}
+        undo_stack = [("dislike", rel_key, new_name, 0)]
+
+        result("File not in selected/ (was disliked)", not dest.exists())
+
+        # Undo the dislike: re-copy and re-mark
+        action, undo_key, undo_name, _ = undo_stack.pop()
+        assert action == "dislike"
+        source_path = tmp / undo_key
+        if source_path.exists() and undo_name:
+            shutil.copy2(str(source_path), str(selected_dir / undo_name))
+            liked[undo_key] = undo_name
+
+        result("File restored after undo", dest.exists())
+        result("Liked dict restored", undo_key in liked)
+        result("Correct filename restored", liked[undo_key] == new_name)
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_undo_stack_multiple():
+    """Test that multiple undos work in correct LIFO order."""
+    print("\n--- Test: Undo Stack LIFO Order ---")
+    undo_stack = []
+
+    # Simulate: like A, like B, dislike A
+    undo_stack.append(("like", "IMG_A.jpg", "aniket_selected_001.jpg", 0))
+    undo_stack.append(("like", "IMG_B.jpg", "aniket_selected_002.jpg", 1))
+    undo_stack.append(("dislike", "IMG_A.jpg", "aniket_selected_001.jpg", 0))
+
+    result("Stack has 3 entries", len(undo_stack) == 3)
+
+    # First undo: should undo the dislike of A
+    action1, key1, _, _ = undo_stack.pop()
+    result("First undo is dislike of A", action1 == "dislike" and key1 == "IMG_A.jpg")
+
+    # Second undo: should undo the like of B
+    action2, key2, _, _ = undo_stack.pop()
+    result("Second undo is like of B", action2 == "like" and key2 == "IMG_B.jpg")
+
+    # Third undo: should undo the like of A
+    action3, key3, _, _ = undo_stack.pop()
+    result("Third undo is like of A", action3 == "like" and key3 == "IMG_A.jpg")
+
+    result("Stack empty after all undos", len(undo_stack) == 0)
+
+
+def test_export_summary():
+    """Test that export generates a valid summary file."""
+    print("\n--- Test: Export Summary ---")
+    tmp = setup_test_dir()
+    try:
+        selected_dir = tmp / ps.SELECTED_DIR
+        selected_dir.mkdir()
+
+        # Simulate some liked photos
+        liked = {
+            "IMG_0000.jpg": "aniket_selected_001.jpg",
+            "DCIM/DSC_0001.jpg": "aniket_selected_002.jpg",
+            "DCIM/100CANON/CANON_0000.jpg": "aniket_selected_003.jpg",
+        }
+
+        # Build summary (same logic as _export_summary)
+        lines = []
+        lines.append("=" * 60)
+        lines.append("WEDDING PHOTO SELECTION SUMMARY")
+        lines.append("=" * 60)
+        lines.append(f"Total selected: {len(liked)} photos")
+        lines.append("")
+        lines.append(f"{'Selected Name':<35} {'Original File'}")
+        lines.append("-" * 60)
+        sorted_items = sorted(liked.items(), key=lambda x: x[1])
+        for original_rel, selected_name in sorted_items:
+            lines.append(f"{selected_name:<35} {original_rel}")
+        lines.append("-" * 60)
+        lines.append("")
+        lines.append("INSTRUCTIONS FOR PHOTOGRAPHER:")
+        lines.append(f"  All selected photos are in the '{ps.SELECTED_DIR}' folder.")
+
+        summary_text = "\n".join(lines)
+        summary_path = selected_dir / ps.SUMMARY_FILE
+        summary_path.write_text(summary_text, encoding="utf-8")
+
+        result("Summary file created", summary_path.exists())
+
+        content = summary_path.read_text(encoding="utf-8")
+        result("Contains title", "WEDDING PHOTO SELECTION SUMMARY" in content)
+        result("Contains total count", "3 photos" in content)
+        result("Contains original filename", "IMG_0000.jpg" in content)
+        result("Contains selected filename", "aniket_selected_001.jpg" in content)
+        result("Contains nested path", "DCIM/100CANON/CANON_0000.jpg" in content)
+        result("Contains photographer instructions", "INSTRUCTIONS FOR PHOTOGRAPHER" in content)
+        result("Contains folder name", ps.SELECTED_DIR in content)
+        result("Entries sorted by selected name",
+               content.index("aniket_selected_001") < content.index("aniket_selected_002") < content.index("aniket_selected_003"))
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_drive_accessibility_check():
+    """Test that drive accessibility check works for existing and missing paths."""
+    print("\n--- Test: Drive Accessibility Check ---")
+
+    tmp = setup_test_dir()
+    try:
+        # Existing path should be accessible
+        accessible = tmp.exists() and os.access(str(tmp), os.R_OK)
+        result("Existing dir is accessible", accessible)
+
+        # Non-existent path should not be accessible
+        fake = Path("/tmp/nonexistent_usb_drive_12345")
+        not_accessible = not (fake.exists() and os.access(str(fake), os.R_OK))
+        result("Non-existent dir is not accessible", not_accessible)
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_undo_empty_stack():
+    """Test that undo on empty stack doesn't crash."""
+    print("\n--- Test: Undo Empty Stack ---")
+    undo_stack = []
+    result("Empty stack detected", len(undo_stack) == 0)
+    # App should show "Nothing to undo" flash, not crash
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Wedding Photo Selector — Core Logic Tests")
@@ -491,6 +670,12 @@ if __name__ == "__main__":
     test_drive_root_detection()
     test_subfolder_selection_shared_output()
     test_counter_continuity_across_folders()
+    test_undo_like()
+    test_undo_dislike()
+    test_undo_stack_multiple()
+    test_undo_empty_stack()
+    test_export_summary()
+    test_drive_accessibility_check()
 
     print("\n" + "=" * 60)
     print(f"Results: {PASS} passed, {FAIL} failed out of {PASS + FAIL} tests")

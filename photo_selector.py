@@ -11,10 +11,13 @@ Controls:
     ← / a          Previous photo
     Space / L      Like photo (copy to selected/)
     X / Delete     Dislike photo (remove from selected/)
+    Ctrl+Z         Undo last like/dislike action
+    E              Export summary for photographer
     P              Play/Pause auto-slideshow
     + / =          Speed up slideshow
     - / _          Slow down slideshow
     F / F11        Toggle fullscreen
+    H / ?          Show/hide keyboard shortcuts
     Q / Escape     Quit
 """
 
@@ -24,6 +27,7 @@ import platform
 import shutil
 import sys
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
@@ -54,6 +58,7 @@ RAW_EXTENSIONS = {
 PROGRESS_FILE = ".photo_selector_progress.json"
 SELECTED_DIR = "Aniket_Selected"
 NAMING_PREFIX = "aniket_selected_"
+SUMMARY_FILE = "selection_summary.txt"
 
 
 class PhotoSelector:
@@ -79,6 +84,11 @@ class PhotoSelector:
         self.current_image = None  # keep reference to prevent GC
         self._resize_job = None
         self._progress_dirty = False
+        self._help_visible = False
+        self._help_widgets = []
+
+        # Undo stack: list of (action, rel_key, selected_name, photo_index) tuples
+        self._undo_stack: list[tuple[str, str, str, int]] = []
 
         # UI setup
         self._build_ui()
@@ -130,11 +140,23 @@ class PhotoSelector:
                                       relief="flat", padx=12, pady=4, cursor="hand2")
         self.dislike_btn.pack(side=tk.LEFT, padx=8, pady=8)
 
+        self.undo_btn = tk.Button(self.bottom_frame, text="↩ Undo", command=self._undo,
+                                   fg="white", bg="#555555", font=("Helvetica", 11),
+                                   relief="flat", padx=12, pady=4, cursor="hand2",
+                                   state=tk.DISABLED)
+        self.undo_btn.pack(side=tk.LEFT, padx=8, pady=8)
+
         self.next_btn = tk.Button(self.bottom_frame, text="Next ▶", command=self._next_photo, **btn_style)
         self.next_btn.pack(side=tk.LEFT, padx=8, pady=8)
 
         self.play_btn = tk.Button(self.bottom_frame, text="▶ Play", command=self._toggle_slideshow, **btn_style)
         self.play_btn.pack(side=tk.LEFT, padx=8, pady=8)
+
+        self.help_btn = tk.Button(self.bottom_frame, text="? Help", command=self._toggle_help, **btn_style)
+        self.help_btn.pack(side=tk.RIGHT, padx=8, pady=8)
+
+        self.export_btn = tk.Button(self.bottom_frame, text="📋 Export", command=self._export_summary, **btn_style)
+        self.export_btn.pack(side=tk.RIGHT, padx=8, pady=8)
 
         self.counter_label = tk.Label(
             self.bottom_frame, text="", fg="#aaaaaa", bg="#1a1a1a",
@@ -169,6 +191,10 @@ class PhotoSelector:
         self.root.bind("X", lambda e: self._dislike_photo())
         self.root.bind("<Delete>", lambda e: self._dislike_photo())
         self.root.bind("<BackSpace>", lambda e: self._dislike_photo())
+        self.root.bind("<Control-z>", lambda e: self._undo())
+        self.root.bind("<Command-z>", lambda e: self._undo())  # macOS Cmd+Z
+        self.root.bind("e", lambda e: self._export_summary())
+        self.root.bind("E", lambda e: self._export_summary())
         self.root.bind("p", lambda e: self._toggle_slideshow())
         self.root.bind("P", lambda e: self._toggle_slideshow())
         self.root.bind("f", lambda e: self._toggle_fullscreen())
@@ -178,6 +204,9 @@ class PhotoSelector:
         self.root.bind("<equal>", lambda e: self._speed_up())
         self.root.bind("<minus>", lambda e: self._slow_down())
         self.root.bind("<underscore>", lambda e: self._slow_down())
+        self.root.bind("h", lambda e: self._toggle_help())
+        self.root.bind("H", lambda e: self._toggle_help())
+        self.root.bind("<question>", lambda e: self._toggle_help())
         self.root.bind("q", lambda e: self._quit())
         self.root.bind("Q", lambda e: self._quit())
         self.root.bind("<Escape>", lambda e: self._quit())
@@ -224,6 +253,25 @@ class PhotoSelector:
 
         # Fallback: use the selected directory itself
         return path
+
+    def _is_drive_accessible(self) -> bool:
+        """Check if the USB drive is still accessible."""
+        try:
+            return self.drive_root.exists() and os.access(str(self.drive_root), os.R_OK)
+        except OSError:
+            return False
+
+    def _check_drive(self) -> bool:
+        """Check drive accessibility and show error if disconnected. Returns True if OK."""
+        if self._is_drive_accessible():
+            return True
+        messagebox.showerror(
+            "Drive Disconnected",
+            f"The USB drive is no longer accessible:\n{self.drive_root}\n\n"
+            "Please reconnect the drive and try again.\n"
+            "Your progress up to the last save has been preserved.",
+        )
+        return False
 
     def _choose_directory(self):
         directory = filedialog.askdirectory(
@@ -301,6 +349,8 @@ class PhotoSelector:
     def _save_progress(self):
         if not self._progress_dirty:
             return
+        if not self._is_drive_accessible():
+            return
         progress_path = self.drive_root / PROGRESS_FILE
         data = {
             "current_index": self.current_index,
@@ -311,7 +361,7 @@ class PhotoSelector:
             progress_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
             self._progress_dirty = False
         except OSError:
-            pass  # USB might be read-only in rare cases
+            pass
 
     def _mark_dirty(self):
         """Mark progress as needing a save, and schedule a debounced write."""
@@ -335,6 +385,11 @@ class PhotoSelector:
                 except Exception:
                     pass
                 return img
+        except OSError:
+            # File may be on a disconnected drive
+            if not self._check_drive():
+                return None
+            return None
         except Exception as e:
             print(f"Error loading {path}: {e}")
             return None
@@ -399,6 +454,12 @@ class PhotoSelector:
         state = "Playing" if self.slideshow_active else "Paused"
         self.slideshow_label.config(text=f"Slideshow: {state} ({speed_sec:.1f}s)")
 
+        # Update undo button state
+        if self._undo_stack:
+            self.undo_btn.config(state=tk.NORMAL, bg="#333333")
+        else:
+            self.undo_btn.config(state=tk.DISABLED, bg="#555555")
+
     @staticmethod
     def _format_size(path: Path) -> str:
         size = path.stat().st_size
@@ -422,6 +483,8 @@ class PhotoSelector:
 
     def _like_photo(self):
         if not self.photos:
+            return
+        if not self._check_drive():
             return
 
         photo_path = self.photos[self.current_index]
@@ -449,10 +512,13 @@ class PhotoSelector:
             shutil.copy2(str(photo_path), str(dest))
         except OSError as e:
             self.like_counter -= 1
+            if not self._check_drive():
+                return
             messagebox.showerror("Error", f"Failed to copy photo:\n{e}")
             return
 
         self.liked[rel_key] = new_name
+        self._undo_stack.append(("like", rel_key, new_name, self.current_index))
         self._mark_dirty()
         self._save_progress()
         self._show_flash(f"♥ Saved as {new_name}")
@@ -460,6 +526,8 @@ class PhotoSelector:
 
     def _dislike_photo(self):
         if not self.photos:
+            return
+        if not self._check_drive():
             return
 
         photo_path = self.photos[self.current_index]
@@ -476,14 +544,186 @@ class PhotoSelector:
                 if selected_path.exists():
                     selected_path.unlink()
             except OSError as e:
+                if not self._check_drive():
+                    return
                 messagebox.showerror("Error", f"Failed to remove photo:\n{e}")
                 return
 
         del self.liked[rel_key]
+        self._undo_stack.append(("dislike", rel_key, selected_name, self.current_index))
         self._mark_dirty()
         self._save_progress()
         self._show_flash("✕ Removed from selection")
         self._show_current()
+
+    def _undo(self):
+        """Undo the last like or dislike action."""
+        if not self._undo_stack:
+            self._show_flash("Nothing to undo")
+            return
+        if not self._check_drive():
+            return
+
+        action, rel_key, selected_name, photo_index = self._undo_stack.pop()
+
+        if action == "like":
+            # Undo a like: remove the copied file and unmark
+            if selected_name and self.selected_dir:
+                selected_path = self.selected_dir / selected_name
+                try:
+                    if selected_path.exists():
+                        selected_path.unlink()
+                except OSError:
+                    pass
+            self.liked.pop(rel_key, None)
+            self._show_flash(f"↩ Undo: removed {selected_name}")
+
+        elif action == "dislike":
+            # Undo a dislike: re-copy the file and re-mark
+            source_path = self.source_dir / rel_key
+            if source_path.exists() and selected_name:
+                if not self.selected_dir.exists():
+                    self.selected_dir.mkdir(parents=True, exist_ok=True)
+                dest = self.selected_dir / selected_name
+                try:
+                    shutil.copy2(str(source_path), str(dest))
+                    self.liked[rel_key] = selected_name
+                    self._show_flash(f"↩ Undo: restored {selected_name}")
+                except OSError:
+                    self._show_flash("↩ Undo failed: copy error")
+                    return
+            else:
+                self._show_flash("↩ Undo failed: source missing")
+                return
+
+        # Navigate to the photo that was affected
+        self.current_index = min(photo_index, len(self.photos) - 1)
+        self._mark_dirty()
+        self._save_progress()
+        self._show_current()
+
+    def _toggle_help(self):
+        """Show or hide the keyboard shortcuts overlay."""
+        if self._help_visible:
+            self._hide_help()
+        else:
+            self._show_help()
+
+    def _show_help(self):
+        self._help_visible = True
+
+        shortcuts = [
+            ("Navigation", [
+                ("→  or  D", "Next photo"),
+                ("←  or  A", "Previous photo"),
+                ("P", "Play / Pause slideshow"),
+                ("+  /  -", "Speed up / slow down"),
+            ]),
+            ("Selection", [
+                ("Space  or  L", "Like photo"),
+                ("X  or  Delete", "Remove from selection"),
+                ("Ctrl+Z", "Undo last action"),
+            ]),
+            ("View", [
+                ("F  or  F11", "Toggle fullscreen"),
+                ("H  or  ?", "Show / hide this help"),
+            ]),
+            ("Other", [
+                ("E", "Export summary for photographer"),
+                ("Q  or  Esc", "Quit"),
+            ]),
+        ]
+
+        # Semi-transparent background overlay
+        canvas_w = self.canvas.winfo_width() or 1200
+        canvas_h = self.canvas.winfo_height() or 700
+
+        overlay = self.canvas.create_rectangle(
+            0, 0, canvas_w, canvas_h, fill="black", stipple="gray50", tags="help",
+        )
+
+        # Title
+        y_pos = canvas_h // 2 - 180
+        self.canvas.create_text(
+            canvas_w // 2, y_pos, text="Keyboard Shortcuts",
+            fill="white", font=("Helvetica", 20, "bold"), tags="help",
+        )
+        y_pos += 40
+
+        for section_name, keys in shortcuts:
+            self.canvas.create_text(
+                canvas_w // 2 - 150, y_pos, text=section_name,
+                fill="#3498db", font=("Helvetica", 14, "bold"), anchor="w", tags="help",
+            )
+            y_pos += 28
+            for key, desc in keys:
+                self.canvas.create_text(
+                    canvas_w // 2 - 130, y_pos, text=key,
+                    fill="#f39c12", font=("Courier", 12, "bold"), anchor="w", tags="help",
+                )
+                self.canvas.create_text(
+                    canvas_w // 2 + 50, y_pos, text=desc,
+                    fill="white", font=("Helvetica", 12), anchor="w", tags="help",
+                )
+                y_pos += 24
+            y_pos += 10
+
+        self.canvas.create_text(
+            canvas_w // 2, y_pos + 10, text="Press H or ? to close",
+            fill="#888888", font=("Helvetica", 11), tags="help",
+        )
+
+    def _hide_help(self):
+        self._help_visible = False
+        self.canvas.delete("help")
+
+    def _export_summary(self):
+        """Export a text summary of selected photos for the photographer."""
+        if not self.liked:
+            self._show_flash("No photos selected yet")
+            return
+        if not self._check_drive():
+            return
+
+        lines = []
+        lines.append("=" * 60)
+        lines.append("WEDDING PHOTO SELECTION SUMMARY")
+        lines.append("=" * 60)
+        lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        lines.append(f"Source:    {self.source_dir}")
+        lines.append(f"Output:    {self.selected_dir}")
+        lines.append(f"Total selected: {len(self.liked)} photos")
+        lines.append("")
+        lines.append("-" * 60)
+        lines.append(f"{'Selected Name':<35} {'Original File'}")
+        lines.append("-" * 60)
+
+        # Sort by selected name for clean output
+        sorted_items = sorted(self.liked.items(), key=lambda x: x[1])
+        for original_rel, selected_name in sorted_items:
+            if selected_name:
+                lines.append(f"{selected_name:<35} {original_rel}")
+            else:
+                lines.append(f"{'(unknown)':<35} {original_rel}")
+
+        lines.append("-" * 60)
+        lines.append("")
+        lines.append("INSTRUCTIONS FOR PHOTOGRAPHER:")
+        lines.append(f"  All selected photos are in the '{SELECTED_DIR}' folder.")
+        lines.append(f"  Files are named {NAMING_PREFIX}001, 002, etc.")
+        lines.append("  Original filenames are listed above for reference.")
+        lines.append("")
+
+        summary_text = "\n".join(lines)
+        summary_path = self.selected_dir / SUMMARY_FILE
+
+        try:
+            if not self.selected_dir.exists():
+                self.selected_dir.mkdir(parents=True, exist_ok=True)
+            summary_path.write_text(summary_text, encoding="utf-8")
+            self._show_flash(f"📋 Exported to {SUMMARY_FILE}")
+        except OSError as e:
+            messagebox.showerror("Export Error", f"Failed to export summary:\n{e}")
 
     def _show_flash(self, text: str):
         # Set color based on action
@@ -491,6 +731,10 @@ class PhotoSelector:
             color = "#e67e22"  # orange for removal
         elif "♥" in text or "Saved" in text:
             color = "#2ecc71"  # green for like
+        elif "↩" in text:
+            color = "#3498db"  # blue for undo
+        elif "📋" in text or "Export" in text:
+            color = "#9b59b6"  # purple for export
         else:
             color = "#e74c3c"  # red for info
 
