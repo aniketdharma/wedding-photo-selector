@@ -119,7 +119,9 @@ def test_like_and_copy():
         shutil.copy2(str(photo), str(dest))
         liked[rel_key] = new_name
 
-        result("selected/ folder created", selected_dir.exists())
+        result("Aniket_Selected folder created", selected_dir.exists())
+        result("Folder name is Aniket_Selected", selected_dir.name == "Aniket_Selected",
+               f"Got {selected_dir.name}")
         result("File copied to selected/", dest.exists())
         result("Correct naming format", new_name == "aniket_selected_001.jpg",
                f"Got {new_name}")

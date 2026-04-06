@@ -52,7 +52,7 @@ RAW_EXTENSIONS = {
 }
 
 PROGRESS_FILE = ".photo_selector_progress.json"
-SELECTED_DIR = "selected"
+SELECTED_DIR = "Aniket_Selected"
 NAMING_PREFIX = "aniket_selected_"
 
 
