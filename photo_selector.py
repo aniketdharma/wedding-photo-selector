@@ -70,6 +70,7 @@ class PhotoSelector:
         self.liked: dict[str, str] = {}
         self.like_counter: int = 0
         self.source_dir: Path | None = None
+        self.drive_root: Path | None = None
         self.selected_dir: Path | None = None
         self.is_fullscreen: bool = False
         self.slideshow_active: bool = False
@@ -188,6 +189,42 @@ class PhotoSelector:
         except ValueError:
             return str(photo_path)
 
+    @staticmethod
+    def _find_drive_root(path: Path) -> Path:
+        """Find the root/mount point of the drive containing the given path.
+
+        - macOS: /Volumes/USB_NAME/
+        - Windows: E:\\
+        - Linux: /media/user/USB_NAME/ or /mnt/usb/
+        - Fallback: the path itself (if not on a removable drive)
+        """
+        resolved = path.resolve()
+
+        # macOS: /Volumes/<name>/...
+        if str(resolved).startswith("/Volumes/"):
+            parts = resolved.parts  # ('/', 'Volumes', 'USB_NAME', ...)
+            if len(parts) >= 3:
+                return Path(parts[0]) / parts[1] / parts[2]
+
+        # Linux: /media/<user>/<name>/...
+        if str(resolved).startswith("/media/"):
+            parts = resolved.parts
+            if len(parts) >= 4:
+                return Path(parts[0]) / parts[1] / parts[2] / parts[3]
+
+        # Linux: /mnt/<name>/...
+        if str(resolved).startswith("/mnt/"):
+            parts = resolved.parts
+            if len(parts) >= 3:
+                return Path(parts[0]) / parts[1] / parts[2]
+
+        # Windows: drive letter root (e.g. E:\)
+        if platform.system() == "Windows":
+            return Path(resolved.anchor)
+
+        # Fallback: use the selected directory itself
+        return path
+
     def _choose_directory(self):
         directory = filedialog.askdirectory(
             title="Select the folder containing your wedding photos (USB drive)",
@@ -198,7 +235,8 @@ class PhotoSelector:
             return
 
         self.source_dir = Path(directory)
-        self.selected_dir = self.source_dir / SELECTED_DIR
+        self.drive_root = self._find_drive_root(self.source_dir)
+        self.selected_dir = self.drive_root / SELECTED_DIR
         self._scan_photos()
         self._load_progress()
         self._show_current()
@@ -232,7 +270,7 @@ class PhotoSelector:
             self.root.destroy()
 
     def _load_progress(self):
-        progress_path = self.source_dir / PROGRESS_FILE
+        progress_path = self.drive_root / PROGRESS_FILE
         if progress_path.exists():
             try:
                 data = json.loads(progress_path.read_text(encoding="utf-8"))
@@ -263,7 +301,7 @@ class PhotoSelector:
     def _save_progress(self):
         if not self._progress_dirty:
             return
-        progress_path = self.source_dir / PROGRESS_FILE
+        progress_path = self.drive_root / PROGRESS_FILE
         data = {
             "current_index": self.current_index,
             "liked": self.liked,

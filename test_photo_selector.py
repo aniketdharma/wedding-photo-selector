@@ -332,6 +332,80 @@ def test_file_extension_preservation():
         shutil.rmtree(tmp)
 
 
+def test_drive_root_detection():
+    """Test that _find_drive_root correctly identifies drive mount points."""
+    print("\n--- Test: Drive Root Detection ---")
+
+    # macOS: /Volumes/USB_NAME/some/subfolder -> /Volumes/USB_NAME
+    mac_path = Path("/Volumes/MyUSB/DCIM/100CANON")
+    mac_root = ps.PhotoSelector._find_drive_root(mac_path)
+    result("macOS: finds /Volumes/USB root", str(mac_root) == "/Volumes/MyUSB",
+           f"Got {mac_root}")
+
+    # macOS: /Volumes/USB_NAME (already at root)
+    mac_root_direct = ps.PhotoSelector._find_drive_root(Path("/Volumes/MyUSB"))
+    result("macOS: root stays at root", str(mac_root_direct) == "/Volumes/MyUSB",
+           f"Got {mac_root_direct}")
+
+    # Linux /media: /media/user/USB/photos -> /media/user/USB
+    linux_media = Path("/media/aniket/WeddingUSB/DCIM/photos")
+    linux_root = ps.PhotoSelector._find_drive_root(linux_media)
+    result("Linux /media: finds mount root", str(linux_root) == "/media/aniket/WeddingUSB",
+           f"Got {linux_root}")
+
+    # Linux /mnt: /mnt/usb/photos -> /mnt/usb
+    linux_mnt = Path("/mnt/usb/photos/subfolder")
+    linux_mnt_root = ps.PhotoSelector._find_drive_root(linux_mnt)
+    result("Linux /mnt: finds mount root", str(linux_mnt_root) == "/mnt/usb",
+           f"Got {linux_mnt_root}")
+
+
+def test_subfolder_selection_shared_output():
+    """Test that selecting a subfolder still puts Aniket_Selected at drive root."""
+    print("\n--- Test: Subfolder Selection -> Shared Output ---")
+    tmp = setup_test_dir()
+    try:
+        dcim = tmp / "DCIM"
+        canon = dcim / "100CANON"
+
+        # Simulate selecting the nested subfolder as source
+        # Drive root detection falls back to source_dir for local tmp paths
+        # but the key logic is: selected_dir = drive_root / SELECTED_DIR
+        # For a real USB on macOS, drive_root would be /Volumes/USB
+
+        # Test the fallback case (not on a real USB mount)
+        drive_root = ps.PhotoSelector._find_drive_root(canon)
+        selected_dir = drive_root / ps.SELECTED_DIR
+
+        # In fallback, drive_root = canon itself, but on real USB it would be the USB root
+        # Let's test the real scenario by simulating a /Volumes path
+        # We can't create /Volumes dirs, so verify the logic with path math
+
+        # Scenario: user selects /Volumes/WeddingUSB/DCIM/100CANON
+        usb_root = Path("/Volumes/WeddingUSB")
+        subfolder = Path("/Volumes/WeddingUSB/DCIM/100CANON")
+        detected_root = ps.PhotoSelector._find_drive_root(subfolder)
+        selected_at_root = detected_root / ps.SELECTED_DIR
+
+        result("Selected dir at USB root, not subfolder",
+               str(selected_at_root) == "/Volumes/WeddingUSB/Aniket_Selected",
+               f"Got {selected_at_root}")
+        result("Not inside subfolder",
+               "100CANON" not in str(selected_at_root))
+        result("Not inside DCIM",
+               "DCIM" not in str(selected_at_root))
+
+        # Same USB, different subfolder selected -> same output dir
+        subfolder2 = Path("/Volumes/WeddingUSB/OtherPhotos")
+        detected_root2 = ps.PhotoSelector._find_drive_root(subfolder2)
+        selected_at_root2 = detected_root2 / ps.SELECTED_DIR
+
+        result("Different subfolder -> same Aniket_Selected location",
+               str(selected_at_root) == str(selected_at_root2))
+    finally:
+        shutil.rmtree(tmp)
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Wedding Photo Selector — Core Logic Tests")
@@ -346,6 +420,8 @@ if __name__ == "__main__":
     test_duplicate_like_prevention()
     test_dislike_nonexistent()
     test_file_extension_preservation()
+    test_drive_root_detection()
+    test_subfolder_selection_shared_output()
 
     print("\n" + "=" * 60)
     print(f"Results: {PASS} passed, {FAIL} failed out of {PASS + FAIL} tests")
